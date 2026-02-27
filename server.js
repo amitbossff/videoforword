@@ -9,6 +9,9 @@ const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { exec } = require('child_process');
+const util = require('util');
+const execPromise = util.promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -40,10 +43,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Origin']
 }));
 
-// Handle preflight requests
 app.options('*', cors());
-
-// Body parsers
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cookieParser(SESSION_SECRET));
@@ -61,11 +61,9 @@ async function connectToMongoDB() {
     dbConnected = true;
     console.log('✅ MongoDB connected successfully');
     
-    // Store db in app locals for routes
     app.locals.db = db.collection(BOT_COLLECTION);
     app.locals.sessions = db.collection(SESSION_COLLECTION);
     
-    // Create indexes
     await db.collection(BOT_COLLECTION).createIndex({ user_id: 1 }, { unique: true });
     await db.collection(BOT_COLLECTION).createIndex({ bot_token: 1 });
     await db.collection(SESSION_COLLECTION).createIndex({ session_id: 1 });
@@ -81,26 +79,21 @@ async function connectToMongoDB() {
 }
 connectToMongoDB();
 
-// ============ MULTER SETUP FOR TEMP FILE STORAGE ============
+// ============ MULTER SETUP ============
 const tempDir = os.tmpdir();
 console.log(`📁 Temp directory: ${tempDir}`);
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, tempDir);
-  },
+  destination: (req, file, cb) => cb(null, tempDir),
   filename: (req, file, cb) => {
     const unique = `${Date.now()}-${uuidv4().substring(0, 8)}`;
-    cb(null, `video-${unique}.mp4`);
+    cb(null, `original-${unique}.mp4`);
   }
 });
 
 const upload = multer({ 
   storage: storage,
-  limits: { 
-    fileSize: 200 * 1024 * 1024, // 200 MB
-    files: 1
-  },
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('video/')) {
       cb(null, true);
@@ -109,6 +102,42 @@ const upload = multer({
     }
   }
 });
+
+// ============ VIDEO COMPRESSION FUNCTION ============
+async function compressVideo(inputPath, maxSizeMB = 10) {
+  const outputPath = inputPath.replace('original-', 'compressed-');
+  const stats = fs.statSync(inputPath);
+  const inputSizeMB = stats.size / (1024 * 1024);
+  
+  console.log(`📊 Original size: ${inputSizeMB.toFixed(2)} MB`);
+  
+  // अगर पहले से 10MB से कम है, तो compress मत करो
+  if (inputSizeMB <= maxSizeMB) {
+    console.log('✅ Video already under 10MB, skipping compression');
+    return inputPath;
+  }
+  
+  try {
+    // bitrate calculate करें
+    const targetBitrate = Math.floor((maxSizeMB * 8 * 1024) / 60); // 60 seconds video के लिए
+    
+    const command = `ffmpeg -i "${inputPath}" -c:v libx264 -preset fast -b:v ${targetBitrate}k -c:a aac -b:a 128k "${outputPath}" -y`;
+    
+    console.log(`🎬 Compressing video...`);
+    await execPromise(command);
+    
+    const compressedStats = fs.statSync(outputPath);
+    console.log(`✅ Compressed size: ${(compressedStats.size / (1024 * 1024)).toFixed(2)} MB`);
+    
+    // Original file delete करें
+    fs.unlinkSync(inputPath);
+    
+    return outputPath;
+  } catch (err) {
+    console.error('❌ Compression failed:', err);
+    return inputPath; // compression fail होने पर original भेजें
+  }
+}
 
 // ============ HELPER FUNCTIONS ============
 async function getBotToken(userId) {
@@ -160,7 +189,7 @@ async function createSession(userId) {
   if (!dbConnected) return null;
   try {
     const sessionId = uuidv4();
-    const expires = new Date(Date.now() + 7 * 86400 * 1000); // 7 days
+    const expires = new Date(Date.now() + 7 * 86400 * 1000);
     await db.collection(SESSION_COLLECTION).insertOne({
       session_id: sessionId,
       user_id: userId,
@@ -213,7 +242,6 @@ async function sendTelegramMessage(token, chatId, text) {
   }
 }
 
-// ============ FIXED TELEGRAM VIDEO FUNCTION WITH THUMBNAIL FIX ============
 async function sendTelegramVideo(token, chatId, filePath, caption) {
   try {
     const url = `https://api.telegram.org/bot${token}/sendVideo`;
@@ -235,26 +263,20 @@ async function sendTelegramVideo(token, chatId, filePath, caption) {
       form.append('caption', caption);
     }
     
-    // ⭐ IMPORTANT: These two lines fix the thumbnail corruption issue
     form.append('supports_streaming', 'true');
     form.append('parse_mode', 'HTML');
 
     const response = await axios.post(url, form, {
-      headers: {
-        ...form.getHeaders(),
-      },
+      headers: form.getHeaders(),
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
-      timeout: 120000 // 2 minutes timeout for large files
+      timeout: 120000
     });
     
-    console.log('✅ Telegram response:', response.data.ok ? 'OK' : 'Failed');
     return response.data;
   } catch (err) {
     console.error('❌ Telegram send error:', err.response?.data || err.message);
-    if (err.response?.data) {
-      return err.response.data;
-    }
+    if (err.response?.data) return err.response.data;
     throw err;
   }
 }
@@ -293,21 +315,14 @@ app.get('/api/check-session', async (req, res) => {
   res.header('Access-Control-Allow-Credentials', 'true');
   
   const sessionId = req.cookies.session;
-  if (!sessionId) {
-    return res.json({ loggedIn: false });
-  }
+  if (!sessionId) return res.json({ loggedIn: false });
   
   const userId = await getSessionUser(sessionId);
-  if (userId) {
-    res.json({ loggedIn: true, userId });
-  } else {
-    res.json({ loggedIn: false });
-  }
+  res.json({ loggedIn: !!userId, userId });
 });
 
 // ============ MAIN BOT WEBHOOK ============
 app.post('/main', async (req, res) => {
-  // Immediately send 200 OK to Telegram
   res.send('OK');
   
   try {
@@ -343,7 +358,6 @@ app.post('/main', async (req, res) => {
       
       try {
         const me = await axios.get(`https://api.telegram.org/bot${botToken}/getMe`);
-        
         if (!me.data.ok) throw new Error('Invalid token');
 
         convState.set(chatId, { 
@@ -444,29 +458,20 @@ app.post('/api/login', express.urlencoded({ extended: false }), async (req, res)
   try {
     const { user_id } = req.body;
     
-    if (!user_id) {
-      return res.status(400).json({ error: 'User ID required' });
-    }
-
-    if (!/^\d+$/.test(user_id)) {
-      return res.status(400).json({ error: 'User ID must contain only numbers' });
-    }
+    if (!user_id) return res.status(400).json({ error: 'User ID required' });
+    if (!/^\d+$/.test(user_id)) return res.status(400).json({ error: 'User ID must contain only numbers' });
 
     const token = await getBotToken(user_id);
-    if (!token) {
-      return res.status(401).json({ error: 'User not registered. Please /add first.' });
-    }
+    if (!token) return res.status(401).json({ error: 'User not registered. Please /add first.' });
 
     const sessionId = await createSession(user_id);
-    if (!sessionId) {
-      return res.status(500).json({ error: 'Could not create session' });
-    }
+    if (!sessionId) return res.status(500).json({ error: 'Could not create session' });
 
     res.cookie('session', sessionId, { 
       httpOnly: true, 
       secure: true, 
       sameSite: 'none',
-      maxAge: 7 * 86400000 // 7 days
+      maxAge: 7 * 86400000
     });
     
     res.json({ success: true });
@@ -477,47 +482,40 @@ app.post('/api/login', express.urlencoded({ extended: false }), async (req, res)
   }
 });
 
-// ============ UPLOAD API (WITH FIXED THUMBNAIL) ============
+// ============ UPLOAD API WITH COMPRESSION ============
 app.post('/api/upload', upload.single('video'), async (req, res) => {
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
   
-  let tempFilePath = null;
+  let finalFilePath = null;
   
   try {
     const sessionId = req.cookies.session;
-    if (!sessionId) {
-      return res.status(401).json({ error: 'Not logged in' });
-    }
+    if (!sessionId) return res.status(401).json({ error: 'Not logged in' });
 
     const userId = await getSessionUser(sessionId);
-    if (!userId) {
-      return res.status(401).json({ error: 'Invalid or expired session' });
-    }
+    if (!userId) return res.status(401).json({ error: 'Invalid or expired session' });
 
     const botToken = await getBotToken(userId);
-    if (!botToken) {
-      return res.status(400).json({ error: 'Bot not linked. Please /add first.' });
-    }
+    if (!botToken) return res.status(400).json({ error: 'Bot not linked. Please /add first.' });
 
-    if (!req.file) {
-      return res.status(400).json({ error: 'No video uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No video uploaded' });
 
-    tempFilePath = req.file.path;
-    const fileSize = req.file.size;
+    const originalPath = req.file.path;
     const caption = req.body.caption || '';
 
-    console.log(`📁 File saved: ${tempFilePath}`);
-    console.log(`📤 Size: ${(fileSize / 1024 / 1024).toFixed(2)} MB for user ${userId}`);
+    console.log(`📁 Original file: ${originalPath}`);
+    
+    // ⭐ VIDEO COMPRESSION - 10MB तक compress करें
+    finalFilePath = await compressVideo(originalPath, 10);
 
-    // Send to Telegram with thumbnail fix
-    const result = await sendTelegramVideo(botToken, userId, tempFilePath, caption);
+    // Send to Telegram
+    const result = await sendTelegramVideo(botToken, userId, finalFilePath, caption);
 
     // Clean up temp file
-    if (fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
-      console.log(`🧹 Temp file deleted: ${tempFilePath}`);
+    if (fs.existsSync(finalFilePath)) {
+      fs.unlinkSync(finalFilePath);
+      console.log(`🧹 Temp file deleted: ${finalFilePath}`);
     }
 
     if (result.ok) {
@@ -534,9 +532,8 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
   } catch (error) {
     console.error('❌ Upload error:', error);
     
-    // Clean up temp file on error
-    if (tempFilePath && fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
+    if (finalFilePath && fs.existsSync(finalFilePath)) {
+      fs.unlinkSync(finalFilePath);
     }
     
     res.status(500).json({ 
@@ -552,9 +549,7 @@ app.post('/api/logout', async (req, res) => {
   res.header('Access-Control-Allow-Credentials', 'true');
   
   const sessionId = req.cookies.session;
-  if (sessionId) {
-    await deleteSession(sessionId);
-  }
+  if (sessionId) await deleteSession(sessionId);
   res.clearCookie('session');
   res.json({ success: true });
 });
@@ -562,7 +557,6 @@ app.post('/api/logout', async (req, res) => {
 // ============ ERROR HANDLING ============
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
-  
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
   
@@ -576,11 +570,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
-// ============ 404 HANDLER ============
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-
 // ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('='.repeat(60));
@@ -591,7 +580,6 @@ app.listen(PORT, () => {
   console.log('='.repeat(60));
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, closing...');
   client.close();
