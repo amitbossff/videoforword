@@ -34,7 +34,7 @@ const allowedOrigins = [
   FRONTEND_URL,
   'http://localhost:5000',
   'http://localhost:3000',
-  'https://videoforword.vercel.app'
+  'https://videosforword.vercel.app'
 ];
 
 app.use(cors({
@@ -67,7 +67,7 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: true, limit: '500mb' }));
 app.use(cookieParser(SESSION_SECRET));
 
-// ============ MONGODB CONNECTION WITH RETRY ============
+// ============ MONGODB CONNECTION WITH RETRY (FIXED) ============
 const client = new MongoClient(MONGODB_URI, {
   connectTimeoutMS: 10000,
   socketTimeoutMS: 45000,
@@ -80,13 +80,66 @@ async function connectToMongoDB() {
     dbConnected = true;
     console.log('✅ MongoDB connected successfully');
     
-    // Create indexes for better performance
-    await db.collection(BOT_COLLECTION).createIndex({ user_id: 1 }, { unique: true });
-    await db.collection(BOT_COLLECTION).createIndex({ bot_token: 1 });
-    await db.collection(SESSION_COLLECTION).createIndex({ session_id: 1 });
-    await db.collection(SESSION_COLLECTION).createIndex({ expires: 1 }, { expireAfterSeconds: 0 });
+    // Check existing collections
+    const collections = await db.listCollections().toArray();
+    const botCollectionExists = collections.some(col => col.name === BOT_COLLECTION);
+    const sessionCollectionExists = collections.some(col => col.name === SESSION_COLLECTION);
     
-    console.log('✅ Database indexes created');
+    // ===== BOT COLLECTION INDEXES =====
+    if (botCollectionExists) {
+      // Try to drop old non-unique index if exists
+      try {
+        await db.collection(BOT_COLLECTION).dropIndex('user_id_1');
+        console.log('✅ Dropped old non-unique index on user_id');
+      } catch (e) {
+        // Index doesn't exist, that's fine
+        console.log('ℹ️ No old index to drop on user_id');
+      }
+    }
+    
+    // Create unique index on user_id
+    try {
+      await db.collection(BOT_COLLECTION).createIndex({ user_id: 1 }, { unique: true });
+      console.log('✅ Created unique index on user_id');
+    } catch (e) {
+      console.log('ℹ️ Index on user_id already exists with different options');
+    }
+    
+    // Create index on bot_token (non-unique)
+    try {
+      await db.collection(BOT_COLLECTION).createIndex({ bot_token: 1 });
+      console.log('✅ Created index on bot_token');
+    } catch (e) {
+      console.log('ℹ️ Index on bot_token already exists');
+    }
+    
+    // ===== SESSION COLLECTION INDEXES =====
+    if (!sessionCollectionExists) {
+      // Create session collection if it doesn't exist
+      await db.createCollection(SESSION_COLLECTION);
+    }
+    
+    // Index on session_id
+    try {
+      await db.collection(SESSION_COLLECTION).createIndex({ session_id: 1 });
+      console.log('✅ Created index on session_id');
+    } catch (e) {
+      console.log('ℹ️ Index on session_id already exists');
+    }
+    
+    // TTL index on expires (auto-delete expired sessions)
+    try {
+      await db.collection(SESSION_COLLECTION).createIndex(
+        { expires: 1 }, 
+        { expireAfterSeconds: 0 }
+      );
+      console.log('✅ Created TTL index on expires');
+    } catch (e) {
+      console.log('ℹ️ TTL index on expires already exists');
+    }
+    
+    console.log('✅ All database indexes configured');
+    
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err.message);
     dbConnected = false;
@@ -501,7 +554,7 @@ app.post('/api/login', express.urlencoded({ extended: false }), async (req, res)
     res.cookie('session', sessionId, { 
       httpOnly: true, 
       secure: true, 
-      sameSite: 'none', // Changed from 'strict' to 'none' for cross-site
+      sameSite: 'none',
       maxAge: 7 * 86400000 // 7 days
     });
     
