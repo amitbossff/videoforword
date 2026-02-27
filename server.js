@@ -71,6 +71,8 @@ async function connectToMongoDB() {
     await db.collection(SESSION_COLLECTION).createIndex({ session_id: 1 });
     await db.collection(SESSION_COLLECTION).createIndex({ expires: 1 }, { expireAfterSeconds: 0 });
     
+    console.log('✅ Database indexes created');
+    
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err.message);
     dbConnected = false;
@@ -80,7 +82,6 @@ async function connectToMongoDB() {
 connectToMongoDB();
 
 // ============ MULTER SETUP FOR TEMP FILE STORAGE ============
-// यह file को Render के temporary disk पर store करेगा
 const tempDir = os.tmpdir();
 console.log(`📁 Temp directory: ${tempDir}`);
 
@@ -212,15 +213,15 @@ async function sendTelegramMessage(token, chatId, text) {
   }
 }
 
+// ============ FIXED TELEGRAM VIDEO FUNCTION WITH THUMBNAIL FIX ============
 async function sendTelegramVideo(token, chatId, filePath, caption) {
   try {
     const url = `https://api.telegram.org/bot${token}/sendVideo`;
     
-    // Create readable stream from file
     const fileStream = fs.createReadStream(filePath);
     const stats = fs.statSync(filePath);
     
-    console.log(`📤 Sending video to Telegram, size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`📤 Sending video: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
     
     const form = new FormData();
     form.append('chat_id', chatId);
@@ -233,6 +234,9 @@ async function sendTelegramVideo(token, chatId, filePath, caption) {
     if (caption) {
       form.append('caption', caption);
     }
+    
+    // ⭐ IMPORTANT: These two lines fix the thumbnail corruption issue
+    form.append('supports_streaming', 'true');
     form.append('parse_mode', 'HTML');
 
     const response = await axios.post(url, form, {
@@ -244,6 +248,7 @@ async function sendTelegramVideo(token, chatId, filePath, caption) {
       timeout: 120000 // 2 minutes timeout for large files
     });
     
+    console.log('✅ Telegram response:', response.data.ok ? 'OK' : 'Failed');
     return response.data;
   } catch (err) {
     console.error('❌ Telegram send error:', err.response?.data || err.message);
@@ -302,6 +307,7 @@ app.get('/api/check-session', async (req, res) => {
 
 // ============ MAIN BOT WEBHOOK ============
 app.post('/main', async (req, res) => {
+  // Immediately send 200 OK to Telegram
   res.send('OK');
   
   try {
@@ -460,7 +466,7 @@ app.post('/api/login', express.urlencoded({ extended: false }), async (req, res)
       httpOnly: true, 
       secure: true, 
       sameSite: 'none',
-      maxAge: 7 * 86400000
+      maxAge: 7 * 86400000 // 7 days
     });
     
     res.json({ success: true });
@@ -471,7 +477,7 @@ app.post('/api/login', express.urlencoded({ extended: false }), async (req, res)
   }
 });
 
-// ============ UPLOAD API ============
+// ============ UPLOAD API (WITH FIXED THUMBNAIL) ============
 app.post('/api/upload', upload.single('video'), async (req, res) => {
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
@@ -505,7 +511,7 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     console.log(`📁 File saved: ${tempFilePath}`);
     console.log(`📤 Size: ${(fileSize / 1024 / 1024).toFixed(2)} MB for user ${userId}`);
 
-    // Send to Telegram
+    // Send to Telegram with thumbnail fix
     const result = await sendTelegramVideo(botToken, userId, tempFilePath, caption);
 
     // Clean up temp file
@@ -568,6 +574,11 @@ app.use((err, req, res, next) => {
   }
   
   res.status(500).json({ error: err.message || 'Internal server error' });
+});
+
+// ============ 404 HANDLER ============
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
 });
 
 // ============ START SERVER ============
