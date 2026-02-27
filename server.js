@@ -6,6 +6,9 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const { v4: uuidv4 } = require('uuid');
 const FormData = require('form-data');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -29,26 +32,9 @@ let db;
 let dbConnected = false;
 const convState = new Map(); // Conversation state
 
-// ============ FIXED CORS CONFIGURATION ============
-const allowedOrigins = [
-  FRONTEND_URL,
-  'http://localhost:5000',
-  'http://localhost:3000',
-  'https://videosforword.vercel.app'
-];
-
+// ============ CORS CONFIGURATION ============
 app.use(cors({
-  origin: function(origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, Postman)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('vercel.app')) {
-      callback(null, true);
-    } else {
-      console.log('❌ Blocked origin:', origin);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: FRONTEND_URL,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Origin']
@@ -58,16 +44,11 @@ app.use(cors({
 app.options('*', cors());
 
 // Body parsers
-app.use(express.json({
-  limit: '500mb',
-  verify: (req, res, buf) => {
-    req.rawBody = buf.toString();
-  }
-}));
-app.use(express.urlencoded({ extended: true, limit: '500mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cookieParser(SESSION_SECRET));
 
-// ============ MONGODB CONNECTION WITH RETRY (FIXED) ============
+// ============ MONGODB CONNECTION ============
 const client = new MongoClient(MONGODB_URI, {
   connectTimeoutMS: 10000,
   socketTimeoutMS: 45000,
@@ -80,84 +61,51 @@ async function connectToMongoDB() {
     dbConnected = true;
     console.log('✅ MongoDB connected successfully');
     
-    // Check existing collections
-    const collections = await db.listCollections().toArray();
-    const botCollectionExists = collections.some(col => col.name === BOT_COLLECTION);
-    const sessionCollectionExists = collections.some(col => col.name === SESSION_COLLECTION);
+    // Store db in app locals for routes
+    app.locals.db = db.collection(BOT_COLLECTION);
+    app.locals.sessions = db.collection(SESSION_COLLECTION);
     
-    // ===== BOT COLLECTION INDEXES =====
-    if (botCollectionExists) {
-      // Try to drop old non-unique index if exists
-      try {
-        await db.collection(BOT_COLLECTION).dropIndex('user_id_1');
-        console.log('✅ Dropped old non-unique index on user_id');
-      } catch (e) {
-        // Index doesn't exist, that's fine
-        console.log('ℹ️ No old index to drop on user_id');
-      }
-    }
-    
-    // Create unique index on user_id
-    try {
-      await db.collection(BOT_COLLECTION).createIndex({ user_id: 1 }, { unique: true });
-      console.log('✅ Created unique index on user_id');
-    } catch (e) {
-      console.log('ℹ️ Index on user_id already exists with different options');
-    }
-    
-    // Create index on bot_token (non-unique)
-    try {
-      await db.collection(BOT_COLLECTION).createIndex({ bot_token: 1 });
-      console.log('✅ Created index on bot_token');
-    } catch (e) {
-      console.log('ℹ️ Index on bot_token already exists');
-    }
-    
-    // ===== SESSION COLLECTION INDEXES =====
-    if (!sessionCollectionExists) {
-      // Create session collection if it doesn't exist
-      await db.createCollection(SESSION_COLLECTION);
-    }
-    
-    // Index on session_id
-    try {
-      await db.collection(SESSION_COLLECTION).createIndex({ session_id: 1 });
-      console.log('✅ Created index on session_id');
-    } catch (e) {
-      console.log('ℹ️ Index on session_id already exists');
-    }
-    
-    // TTL index on expires (auto-delete expired sessions)
-    try {
-      await db.collection(SESSION_COLLECTION).createIndex(
-        { expires: 1 }, 
-        { expireAfterSeconds: 0 }
-      );
-      console.log('✅ Created TTL index on expires');
-    } catch (e) {
-      console.log('ℹ️ TTL index on expires already exists');
-    }
-    
-    console.log('✅ All database indexes configured');
+    // Create indexes
+    await db.collection(BOT_COLLECTION).createIndex({ user_id: 1 }, { unique: true });
+    await db.collection(BOT_COLLECTION).createIndex({ bot_token: 1 });
+    await db.collection(SESSION_COLLECTION).createIndex({ session_id: 1 });
+    await db.collection(SESSION_COLLECTION).createIndex({ expires: 1 }, { expireAfterSeconds: 0 });
     
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err.message);
     dbConnected = false;
-    // Retry after 5 seconds
     setTimeout(connectToMongoDB, 5000);
   }
 }
-
-// Start connection
 connectToMongoDB();
 
-// ============ MULTER SETUP (200MB limit) ============
-const storage = multer.memoryStorage();
-const upload = multer({
-  storage,
+// ============ MULTER SETUP FOR TEMP FILE STORAGE ============
+// यह file को Render के temporary disk पर store करेगा
+const tempDir = os.tmpdir();
+console.log(`📁 Temp directory: ${tempDir}`);
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, tempDir);
+  },
+  filename: (req, file, cb) => {
+    const unique = `${Date.now()}-${uuidv4().substring(0, 8)}`;
+    cb(null, `video-${unique}.mp4`);
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
   limits: { 
     fileSize: 200 * 1024 * 1024, // 200 MB
     files: 1
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('video/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only video files are allowed'), false);
+    }
   }
 });
 
@@ -218,7 +166,6 @@ async function createSession(userId) {
       created_at: new Date(),
       expires
     });
-    console.log('✅ Session created for user:', userId);
     return sessionId;
   } catch (err) {
     console.error('Error creating session:', err);
@@ -244,7 +191,6 @@ async function deleteSession(sessionId) {
   if (!dbConnected) return;
   try {
     await db.collection(SESSION_COLLECTION).deleteOne({ session_id: sessionId });
-    console.log('✅ Session deleted:', sessionId);
   } catch (err) {
     console.error('Error deleting session:', err);
   }
@@ -266,32 +212,45 @@ async function sendTelegramMessage(token, chatId, text) {
   }
 }
 
-async function sendTelegramVideo(token, chatId, buffer, caption) {
+async function sendTelegramVideo(token, chatId, filePath, caption) {
   try {
     const url = `https://api.telegram.org/bot${token}/sendVideo`;
+    
+    // Create readable stream from file
+    const fileStream = fs.createReadStream(filePath);
+    const stats = fs.statSync(filePath);
+    
+    console.log(`📤 Sending video to Telegram, size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+    
     const form = new FormData();
     form.append('chat_id', chatId);
-    form.append('video', buffer, { 
+    form.append('video', fileStream, { 
       filename: 'video.mp4', 
-      contentType: 'video/mp4' 
-    });
-    if (caption) form.append('caption', caption);
-    form.append('parse_mode', 'HTML');
-
-    const res = await axios.post(url, form, {
-      headers: {
-        ...form.getHeaders(),
-        'Content-Length': form.getLengthSync()
-      },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity
+      contentType: 'video/mp4',
+      knownLength: stats.size
     });
     
-    console.log('✅ Video sent to Telegram:', res.data.ok);
-    return res.data;
+    if (caption) {
+      form.append('caption', caption);
+    }
+    form.append('parse_mode', 'HTML');
+
+    const response = await axios.post(url, form, {
+      headers: {
+        ...form.getHeaders(),
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 120000 // 2 minutes timeout for large files
+    });
+    
+    return response.data;
   } catch (err) {
-    console.error('Error sending Telegram video:', err.response?.data || err.message);
-    return { ok: false, error: err.message };
+    console.error('❌ Telegram send error:', err.response?.data || err.message);
+    if (err.response?.data) {
+      return err.response.data;
+    }
+    throw err;
   }
 }
 
@@ -303,7 +262,6 @@ async function setWebhook(token, webhookUrl) {
       max_connections: 40,
       allowed_updates: ['message']
     });
-    console.log('✅ Webhook set for token:', token.substring(0, 10) + '...');
     return res.data;
   } catch (err) {
     console.error('Error setting webhook:', err.response?.data || err.message);
@@ -311,20 +269,12 @@ async function setWebhook(token, webhookUrl) {
   }
 }
 
-// ============ HEALTH CHECK ENDPOINTS ============
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: '🚀 Bot system is running!',
-    mongodb: dbConnected ? 'connected' : 'disconnected',
-    time: new Date().toISOString()
-  });
-});
-
+// ============ HEALTH CHECK ============
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     mongodb: dbConnected ? 'connected' : 'disconnected',
+    tempDir: tempDir,
     time: new Date().toISOString()
   });
 });
@@ -332,7 +282,7 @@ app.get('/health', (req, res) => {
 app.head('/main', (req, res) => res.send('OK'));
 app.get('/main', (req, res) => res.send('OK'));
 
-// ============ CHECK SESSION ENDPOINT ============
+// ============ CHECK SESSION ============
 app.get('/api/check-session', async (req, res) => {
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
@@ -352,24 +302,19 @@ app.get('/api/check-session', async (req, res) => {
 
 // ============ MAIN BOT WEBHOOK ============
 app.post('/main', async (req, res) => {
-  // Immediately send 200 OK to Telegram
   res.send('OK');
   
   try {
     const update = req.body;
-    console.log('📩 Received update:', update?.update_id);
-    
     const message = update?.message;
     if (!message) return;
 
     const chatId = message.chat.id;
     const text = message.text || '';
-    const username = message.from?.username || 'No username';
     const firstName = message.from?.first_name || 'User';
 
-    console.log(`💬 Message from ${firstName} (@${username}): ${text}`);
+    const state = convState.get(chatId);
 
-    // Handle /start command
     if (text === '/start') {
       await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
         `Hello ${firstName}! 👋\n\n` +
@@ -379,10 +324,6 @@ app.post('/main', async (req, res) => {
       return;
     }
 
-    // Get conversation state
-    const state = convState.get(chatId);
-
-    // Handle /add command
     if (text === '/add') {
       convState.set(chatId, { step: 'awaiting_token' });
       await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
@@ -391,19 +332,14 @@ app.post('/main', async (req, res) => {
       return;
     }
 
-    // Handle token input
     if (state && state.step === 'awaiting_token') {
       const botToken = text.trim();
       
       try {
-        // Validate token by getting bot info
         const me = await axios.get(`https://api.telegram.org/bot${botToken}/getMe`);
         
-        if (!me.data.ok) {
-          throw new Error('Invalid token');
-        }
+        if (!me.data.ok) throw new Error('Invalid token');
 
-        // Store token temporarily in conversation state
         convState.set(chatId, { 
           step: 'awaiting_userid', 
           botToken,
@@ -416,40 +352,29 @@ app.post('/main', async (req, res) => {
           `(You can get it from @userinfobot)`
         );
       } catch (error) {
-        await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
-          '❌ Invalid token. Please check and try again.'
-        );
+        await sendTelegramMessage(MAIN_BOT_TOKEN, chatId, '❌ Invalid token. Please try again.');
         convState.delete(chatId);
       }
       return;
     }
 
-    // Handle user ID input
     if (state && state.step === 'awaiting_userid') {
       const userId = text.trim();
       
-      // Validate user ID (should be numbers only)
       if (!/^\d+$/.test(userId)) {
-        await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
-          '❌ User ID must contain only numbers. Please try again.'
-        );
+        await sendTelegramMessage(MAIN_BOT_TOKEN, chatId, '❌ User ID must contain only numbers.');
         return;
       }
 
       const botToken = state.botToken;
-      
-      // Store in MongoDB
       const stored = await storeBotLink(userId, botToken);
       
       if (!stored) {
-        await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
-          '⚠️ Database connection issue. Please try again later.'
-        );
+        await sendTelegramMessage(MAIN_BOT_TOKEN, chatId, '⚠️ Database issue. Try again later.');
         convState.delete(chatId);
         return;
       }
 
-      // Set webhook for user's bot
       const webhookUrl = `${BASE_URL}/webhook/${botToken}`;
       const setResult = await setWebhook(botToken, webhookUrl);
 
@@ -457,91 +382,72 @@ app.post('/main', async (req, res) => {
         await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
           `✅ Bot successfully linked!\n\n` +
           `You can now login at: ${FRONTEND_URL}\n` +
-          `Use your User ID: ${userId}\n\n` +
-          `📤 Upload videos and they'll be sent to your bot!`
+          `Use your User ID: ${userId}`
         );
       } else {
         await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
-          `⚠️ Bot linked but webhook setup failed.\n` +
-          `Please manually set webhook to:\n${webhookUrl}`
+          `⚠️ Bot linked but webhook failed.\nManual webhook: ${webhookUrl}`
         );
       }
 
-      // Clear conversation state
       convState.delete(chatId);
       return;
     }
 
-    // Default response for unknown messages
     await sendTelegramMessage(MAIN_BOT_TOKEN, chatId,
       'Use /add to link your bot, or /start to see welcome message.'
     );
 
   } catch (error) {
-    console.error('❌ Error processing webhook:', error);
+    console.error('❌ Webhook error:', error);
   }
 });
 
 // ============ LINKED BOT WEBHOOK ============
 app.post('/webhook/:token', async (req, res) => {
-  // Immediately respond
   res.send('OK');
   
   try {
     const { token } = req.params;
     const update = req.body;
-    
     const message = update?.message;
     if (!message) return;
 
-    // Get user ID associated with this bot token
     const userId = await getUserIdByToken(token);
-    if (!userId) {
-      console.log('Unknown bot token:', token?.substring(0, 10) + '...');
-      return;
-    }
+    if (!userId) return;
 
-    // Handle /start command on linked bot
     if (message.text === '/start') {
-      await sendTelegramMessage(token, userId,
-        '✅ Your bot is active and ready!\n\n' +
-        'Anyone can start this bot, and you\'ll receive videos from your web interface.'
-      );
+      await sendTelegramMessage(token, userId, '✅ Your bot is active and ready!');
       
-      // Also notify the person who started the bot
       if (message.chat.id.toString() !== userId) {
         await sendTelegramMessage(token, message.chat.id,
-          '👋 Welcome! This bot is linked to another user for video delivery.'
+          '👋 This bot is linked to another user for video delivery.'
         );
       }
     }
   } catch (error) {
-    console.error('Error processing linked bot webhook:', error);
+    console.error('Linked bot webhook error:', error);
   }
 });
 
-// ============ API: LOGIN ============
+// ============ LOGIN API ============
 app.post('/api/login', express.urlencoded({ extended: false }), async (req, res) => {
-  // Set CORS headers
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
   
   try {
     const { user_id } = req.body;
-    console.log('🔐 Login attempt for user:', user_id);
     
     if (!user_id) {
       return res.status(400).json({ error: 'User ID required' });
     }
 
-    // Validate user_id format
     if (!/^\d+$/.test(user_id)) {
       return res.status(400).json({ error: 'User ID must contain only numbers' });
     }
 
     const token = await getBotToken(user_id);
     if (!token) {
-      console.log('❌ User not registered:', user_id);
       return res.status(401).json({ error: 'User not registered. Please /add first.' });
     }
 
@@ -550,15 +456,13 @@ app.post('/api/login', express.urlencoded({ extended: false }), async (req, res)
       return res.status(500).json({ error: 'Could not create session' });
     }
 
-    // Set cookie
     res.cookie('session', sessionId, { 
       httpOnly: true, 
       secure: true, 
       sameSite: 'none',
-      maxAge: 7 * 86400000 // 7 days
+      maxAge: 7 * 86400000
     });
     
-    console.log('✅ Login successful for user:', user_id);
     res.json({ success: true });
     
   } catch (error) {
@@ -567,11 +471,12 @@ app.post('/api/login', express.urlencoded({ extended: false }), async (req, res)
   }
 });
 
-// ============ API: UPLOAD ============
+// ============ UPLOAD API ============
 app.post('/api/upload', upload.single('video'), async (req, res) => {
-  // Set CORS headers
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
+  
+  let tempFilePath = null;
   
   try {
     const sessionId = req.cookies.session;
@@ -589,36 +494,54 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
       return res.status(400).json({ error: 'Bot not linked. Please /add first.' });
     }
 
-    const videoFile = req.file;
-    if (!videoFile) {
+    if (!req.file) {
       return res.status(400).json({ error: 'No video uploaded' });
     }
 
+    tempFilePath = req.file.path;
+    const fileSize = req.file.size;
     const caption = req.body.caption || '';
 
-    console.log(`📤 Uploading video for user ${userId}, size: ${(videoFile.size / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`📁 File saved: ${tempFilePath}`);
+    console.log(`📤 Size: ${(fileSize / 1024 / 1024).toFixed(2)} MB for user ${userId}`);
 
-    const result = await sendTelegramVideo(botToken, userId, videoFile.buffer, caption);
+    // Send to Telegram
+    const result = await sendTelegramVideo(botToken, userId, tempFilePath, caption);
+
+    // Clean up temp file
+    if (fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+      console.log(`🧹 Temp file deleted: ${tempFilePath}`);
+    }
 
     if (result.ok) {
       console.log(`✅ Video sent successfully to ${userId}`);
       res.json({ success: true });
     } else {
-      console.error('Telegram API error:', result);
+      console.error('Telegram error:', result);
       res.status(500).json({ 
         success: false, 
         error: result.description || 'Failed to send video' 
       });
     }
+
   } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error('❌ Upload error:', error);
+    
+    // Clean up temp file on error
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Upload failed'
+    });
   }
 });
 
-// ============ API: LOGOUT ============
+// ============ LOGOUT API ============
 app.post('/api/logout', async (req, res) => {
-  // Set CORS headers
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
   
@@ -630,20 +553,10 @@ app.post('/api/logout', async (req, res) => {
   res.json({ success: true });
 });
 
-// ============ OPTIONS HANDLER FOR ALL ROUTES ============
-app.options('/api/*', (req, res) => {
-  res.header('Access-Control-Allow-Origin', FRONTEND_URL);
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.sendStatus(200);
-});
-
-// ============ ERROR HANDLING MIDDLEWARE ============
+// ============ ERROR HANDLING ============
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
   
-  // Set CORS headers for errors too
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
   res.header('Access-Control-Allow-Credentials', 'true');
   
@@ -651,35 +564,31 @@ app.use((err, req, res, next) => {
     if (err.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ error: 'File too large. Maximum size is 200MB.' });
     }
+    return res.status(400).json({ error: err.message });
   }
   
-  res.status(500).json({ error: 'Internal server error: ' + err.message });
-});
-
-// ============ 404 HANDLER ============
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
+  res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
 // ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('='.repeat(60));
-  console.log(`🚀 Server is running on port ${PORT}`);
-  console.log(`📱 Main bot webhook URL: ${BASE_URL}/main`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📱 Main bot webhook: ${BASE_URL}/main`);
   console.log(`🌐 Frontend URL: ${FRONTEND_URL}`);
-  console.log(`💾 MongoDB: ${dbConnected ? '✅ Connected' : '❌ Connecting...'}`);
+  console.log(`📁 Temp directory: ${tempDir}`);
   console.log('='.repeat(60));
 });
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, closing connections...');
-  await client.close();
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, closing...');
+  client.close();
   process.exit(0);
 });
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, closing connections...');
-  await client.close();
+process.on('SIGINT', () => {
+  console.log('SIGINT received, closing...');
+  client.close();
   process.exit(0);
 });
